@@ -8,21 +8,20 @@ model/session.
 from __future__ import annotations
 
 import json
+import logging
 import os
-import re
-from typing import Any
+from typing import Any, Optional
 
+from hermes_cli.kanban_client_safe import CLIENT_SAFE_STYLE, client_safe_text
 from tools.registry import registry, tool_error
+
+logger = logging.getLogger(__name__)
 
 BOARD = "commercial-intake"
 DEFAULT_WORKSPACE = "/Users/chulu/AI/kai-commercial-agents/clients/_intake"
 ALLOWED_ASSIGNEES = {"kai-sell", "kai-build", "kai-comply"}
 REPORT_COMMENT_AUTHOR = "frontdesk-reporter"
 REPORT_COMMENT_PREFIX = "reported_by="
-_TASK_ID_RE = re.compile(r"\bt_[0-9a-fA-F]{12}\b")
-_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<!\w)/(?:Users|private|var|tmp|home|opt|Volumes)/[^\s,;)\]}]+"
-)
 
 
 def _ok(**kwargs: Any) -> str:
@@ -42,18 +41,36 @@ def _tenant_from_args(args: dict) -> str:
 
 
 def _client_safe_text(value: Any, *, fallback: str = "") -> str:
-    """Return text safe for the client-facing model to quote.
+    """Scrub internal artifacts before text reaches the client-facing model.
 
-    Worker summaries should already be client-ready. This is a final belt-and-
-    suspenders pass to strip common internal artifacts (Kanban task ids and
-    local filesystem paths) before the report tool output reaches the model.
+    Shared with the gateway kanban notifier via
+    :mod:`hermes_cli.kanban_client_safe` so pull reports and push
+    notifications scrub identically.
     """
-    text = str(value or "").strip()
-    if not text:
-        return fallback
-    text = _TASK_ID_RE.sub("the work item", text)
-    text = _ABSOLUTE_PATH_RE.sub("[file]", text)
-    return text
+    return client_safe_text(value, fallback=fallback)
+
+
+def _origin_from_session_env() -> Optional[dict[str, str]]:
+    """Return the originating gateway chat (platform/chat/thread/user).
+
+    Same source as ``tools.cronjob_tools._origin_from_env``: the gateway
+    session context. Returns None outside a gateway session (CLI, tests)
+    so delegation still works there — just without push report-back.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+    platform = get_session_env("HERMES_SESSION_PLATFORM")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    if not platform or not chat_id:
+        return None
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": get_session_env("HERMES_SESSION_THREAD_ID") or None,
+        "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+    }
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -134,7 +151,7 @@ def _handle_frontdesk_delegate(args: dict, **kw) -> str:
 
         conn = kb.connect(board=BOARD)
         try:
-            kb.create_task(
+            task_id = kb.create_task(
                 conn,
                 title=title,
                 body=body,
@@ -150,8 +167,34 @@ def _handle_frontdesk_delegate(args: dict, **kw) -> str:
                 created_by=_profile_name(),
                 session_id=os.environ.get("HERMES_SESSION_ID"),
             )
+            # Close the loop: subscribe the originating client chat so the
+            # gateway notifier pushes a client-safe report when the worker
+            # finishes, instead of waiting for the client to ask. Best
+            # effort — a failed subscription must not fail the intake.
+            auto_notify = False
+            origin = _origin_from_session_env()
+            if origin:
+                try:
+                    kb.add_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        platform=origin["platform"],
+                        chat_id=origin["chat_id"],
+                        thread_id=origin["thread_id"],
+                        user_id=origin["user_id"],
+                        notifier_profile=_profile_name(),
+                        style=CLIENT_SAFE_STYLE,
+                    )
+                    auto_notify = True
+                except Exception:
+                    logger.warning(
+                        "frontdesk_delegate: notify subscription failed; "
+                        "client will need to ask for status",
+                        exc_info=True,
+                    )
             return _ok(
                 status="ready",
+                auto_notify=auto_notify,
                 client_message="Received — I’ll have the team work on this and report back.",
             )
         finally:
@@ -292,7 +335,9 @@ FRONTDESK_DELEGATE_SCHEMA = {
         "Create one internal work item for the KAI agent fleet from a client "
         "Telegram request. This is the only delegation surface available to "
         "client-facing front-desk profiles. Never reveal returned internal IDs "
-        "or board details to the client."
+        "or board details to the client. When the result has auto_notify=true, "
+        "this chat will automatically receive a client-safe report when the "
+        "work finishes — no need to poll frontdesk_report."
     ),
     "parameters": {
         "type": "object",

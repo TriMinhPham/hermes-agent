@@ -233,3 +233,141 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+def _create_client_safe_task(title="Prepare GEO audit"):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title=title, assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            style="client_safe",
+        )
+        return tid
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_client_safe_completed_scrubs_internals(tmp_path, monkeypatch):
+    db_path = tmp_path / "client-safe-completed.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_client_safe_task()
+    conn = kb.connect()
+    try:
+        kb.complete_task(
+            conn, tid,
+            summary=f"Report ready. Draft saved to /Users/me/clients/acme/report.docx for {tid}.",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert text.startswith("✅")
+    assert "Report ready." in text
+    assert tid not in text
+    assert "Kanban" not in text
+    assert "@worker" not in text
+    assert "/Users/" not in text
+
+
+def test_kanban_notifier_client_safe_suppresses_crash_noise(tmp_path, monkeypatch):
+    db_path = tmp_path / "client-safe-crash.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_client_safe_task()
+    conn = kb.connect()
+    try:
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Nothing reaches the client, and the cursor still advanced so the
+    # suppressed event is not replayed on the next tick.
+    assert adapter.sent == []
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_kanban_notifier_client_safe_blocked_hides_internal_reason(tmp_path, monkeypatch):
+    db_path = tmp_path / "client-safe-blocked.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_client_safe_task()
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, tid, reason="needs Director approval for vendor payment")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "additional review" in text
+    assert "Director" not in text
+    assert "Kanban" not in text
+    assert tid not in text
+
+    # Blocked is not final: the subscription survives so an unblock →
+    # complete cycle still reports back to the client.
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+class ArtifactRecordingAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.documents = []
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append(file_path)
+
+    def extract_local_files(self, text):
+        import re
+
+        return re.findall(r"(?<!\w)/[^\s,;)\]}]+", text), text
+
+
+def test_deliver_kanban_artifacts_explicit_only_skips_summary_paths(tmp_path):
+    explicit = tmp_path / "deliverable.txt"
+    explicit.write_text("client deliverable")
+    mentioned = tmp_path / "internal-notes.txt"
+    mentioned.write_text("internal scratch file")
+
+    payload = {
+        "artifacts": [str(explicit)],
+        "summary": f"Done. Working notes in {mentioned}",
+    }
+
+    adapter = ArtifactRecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(runner._deliver_kanban_artifacts(
+        adapter=adapter, chat_id="chat-1", metadata={},
+        event_payload=payload, task=None, explicit_only=True,
+    ))
+    assert adapter.documents == [str(explicit.resolve())]
+
+    adapter = ArtifactRecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(runner._deliver_kanban_artifacts(
+        adapter=adapter, chat_id="chat-1", metadata={},
+        event_payload=payload, task=None,
+    ))
+    assert set(adapter.documents) == {str(explicit.resolve()), str(mentioned.resolve())}

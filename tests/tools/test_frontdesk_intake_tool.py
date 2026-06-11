@@ -170,3 +170,104 @@ def test_frontdesk_report_marks_completed_items_as_reported(monkeypatch, tmp_pat
     assert first["completed_count"] == 1
     assert second["completed_count"] == 0
     assert include["completed_count"] == 1
+
+
+def test_frontdesk_delegate_subscribes_origin_chat_for_push_reportback(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    session = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-42",
+        "HERMES_SESSION_THREAD_ID": "7",
+        "HERMES_SESSION_USER_ID": "user-9",
+    }
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": session.get(name, default),
+    )
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(ft._handle_frontdesk_delegate({
+        "client_request": "Audit our AI search visibility.",
+        "assignee": "kai-sell",
+        "tenant": "acme",
+    }))
+    assert out["ok"] is True
+    assert out["auto_notify"] is True
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        task = kb.list_tasks(conn, tenant="acme")[0]
+        subs = kb.list_notify_subs(conn, task.id)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    sub = subs[0]
+    assert sub["platform"] == "telegram"
+    assert sub["chat_id"] == "chat-42"
+    assert sub["thread_id"] == "7"
+    assert sub["user_id"] == "user-9"
+    assert sub["notifier_profile"] == "client-acme-staff"
+    assert sub["style"] == "client_safe"
+
+
+def test_frontdesk_delegate_without_gateway_session_skips_subscription(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": default,
+    )
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(ft._handle_frontdesk_delegate({
+        "client_request": "Audit our AI search visibility.",
+        "assignee": "kai-sell",
+        "tenant": "acme",
+    }))
+    assert out["ok"] is True
+    assert out["auto_notify"] is False
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        task = kb.list_tasks(conn, tenant="acme")[0]
+        subs = kb.list_notify_subs(conn, task.id)
+    finally:
+        conn.close()
+    assert subs == []
+
+
+def test_frontdesk_delegate_survives_subscription_failure(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": {"HERMES_SESSION_PLATFORM": "telegram",
+                                  "HERMES_SESSION_CHAT_ID": "chat-42"}.get(name, default),
+    )
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("subs table unavailable")
+
+    monkeypatch.setattr(kb, "add_notify_sub", boom)
+
+    out = json.loads(ft._handle_frontdesk_delegate({
+        "client_request": "Audit our AI search visibility.",
+        "assignee": "kai-sell",
+        "tenant": "acme",
+    }))
+    assert out["ok"] is True
+    assert out["auto_notify"] is False
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        assert len(kb.list_tasks(conn, tenant="acme")) == 1
+    finally:
+        conn.close()

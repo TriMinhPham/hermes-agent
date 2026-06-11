@@ -75,6 +75,10 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        from hermes_cli.kanban_client_safe import (
+            CLIENT_SAFE_STYLE as _CLIENT_SAFE_STYLE,
+            format_client_safe_event as _format_client_safe_event,
+        )
 
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
         # Subscriptions are removed only when the task reaches a truly final
@@ -235,14 +239,35 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
+                    # Client-safe subscriptions (front-desk profiles) get a
+                    # scrubbed, client-facing rendering: no task ids, no
+                    # assignee tags, no paths, and internal retry noise
+                    # (crashed / timed_out) is suppressed entirely.
+                    client_safe = (sub.get("style") or "") == _CLIENT_SAFE_STYLE
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
+                        # Unused by the client-safe rendering, which never
+                        # names internal workers.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if client_safe:
+                            summary = None
+                            if ev.payload and ev.payload.get("summary"):
+                                summary = str(ev.payload["summary"])
+                            elif task and task.result:
+                                summary = str(task.result)
+                            msg = _format_client_safe_event(
+                                kind, title=title, summary=summary,
+                            )
+                            if msg is None:
+                                # Internal-only event (crash/timeout retry
+                                # noise); skip the message but let the cursor
+                                # advance so it isn't replayed.
+                                continue
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -318,12 +343,17 @@ class GatewayKanbanWatchersMixin:
                             # we never spam attachments on retries.
                             if kind == "completed":
                                 try:
+                                    # Client-safe subs only deliver explicit
+                                    # ``kanban_complete(artifacts=[...])``
+                                    # handoffs — paths merely mentioned in
+                                    # summary/result text stay internal.
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
+                                        explicit_only=client_safe,
                                     )
                                 except Exception as art_exc:
                                     logger.debug(
@@ -455,6 +485,7 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
+        explicit_only: bool = False,
     ) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
@@ -467,6 +498,10 @@ class GatewayKanbanWatchersMixin:
           1. ``event_payload['artifacts']`` (explicit list — preferred)
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
+
+        ``explicit_only`` restricts scanning to source 1 — used for
+        client-safe subscriptions, where a path mentioned in summary text
+        may be an internal working file rather than a deliverable.
 
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
@@ -498,13 +533,13 @@ class GatewayKanbanWatchersMixin:
 
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if not explicit_only and isinstance(summary, str) and summary:
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
+        if not explicit_only and task is not None and getattr(task, "result", None):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:
