@@ -32,12 +32,26 @@ def _profile_name() -> str:
     return os.environ.get("HERMES_PROFILE") or "commercial-frontdesk"
 
 
-def _tenant_from_args(args: dict) -> str:
+def _tenant() -> str:
+    """Tenant comes from trusted profile config (env), never from the model.
+
+    A client-facing profile serves exactly one tenant. Accepting a tenant
+    argument from the model would let a prompt-injected client read another
+    tenant's summaries through frontdesk_report (same created_by profile).
+    """
     return (
-        str(args.get("tenant") or os.environ.get("HERMES_FRONTDESK_TENANT") or "commercial-intake")
-        .strip()
-        or "commercial-intake"
-    )
+        os.environ.get("HERMES_FRONTDESK_TENANT") or "commercial-intake"
+    ).strip() or "commercial-intake"
+
+
+def _workspace_path() -> str:
+    """Workspace comes from trusted profile config (env), never from the model.
+
+    Exposing a path argument on a client-facing schema would let a
+    prompt-injected client point delegated workers at arbitrary directories
+    (another client's workspace, system paths).
+    """
+    return os.environ.get("HERMES_FRONTDESK_WORKSPACE") or DEFAULT_WORKSPACE
 
 
 def _client_safe_text(value: Any, *, fallback: str = "") -> str:
@@ -125,7 +139,7 @@ def _handle_frontdesk_delegate(args: dict, **kw) -> str:
     clarified = str(args.get("clarified_requirements") or "").strip()
     constraints = str(args.get("constraints") or "").strip()
     approval = str(args.get("approval_requirements") or "").strip()
-    tenant = _tenant_from_args(args)
+    tenant = _tenant()
     title = str(args.get("title") or client_request[:80]).strip()
     priority = int(args.get("priority") or 0)
 
@@ -159,7 +173,7 @@ def _handle_frontdesk_delegate(args: dict, **kw) -> str:
                 tenant=tenant,
                 priority=priority,
                 workspace_kind="dir",
-                workspace_path=str(args.get("workspace_path") or DEFAULT_WORKSPACE),
+                workspace_path=_workspace_path(),
                 # create_task's historical default is "running", but the
                 # function maps that to a ready task when there are no
                 # incomplete parents. "ready" is not accepted as an input.
@@ -221,7 +235,7 @@ def _handle_frontdesk_report(args: dict, **kw) -> str:
     paths, run metadata, and artifact paths so the model can safely summarize it
     to the client.
     """
-    tenant = _tenant_from_args(args)
+    tenant = _tenant()
     profile = _profile_name()
     include_reported = _coerce_bool(args.get("include_reported"))
     mark_reported = _coerce_bool(args.get("mark_reported"))
@@ -319,7 +333,6 @@ FRONTDESK_REPORT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "tenant": {"type": "string", "description": "Client/tenant slug. Defaults to this profile's configured tenant."},
             "status": {"type": "string", "enum": ["all", "active", "completed", "blocked"], "description": "Filter returned work. Default all."},
             "include_reported": {"type": "boolean", "description": "Include completed items already reported to the client. Default false."},
             "mark_reported": {"type": "boolean", "description": "Mark returned completed items as reported after surfacing them. Default false."},
@@ -350,8 +363,6 @@ FRONTDESK_DELEGATE_SCHEMA = {
             "approval_requirements": {"type": "string", "description": "Safety/approval requirements for this task."},
             "assignee": {"type": "string", "enum": ["kai-sell", "kai-build", "kai-comply"], "description": "Internal specialist profile to execute the task."},
             "priority": {"type": "integer", "description": "Higher number = higher priority. Default 0."},
-            "tenant": {"type": "string", "description": "Client/tenant slug if known; otherwise commercial-intake."},
-            "workspace_path": {"type": "string", "description": "Optional client workspace directory."},
         },
         "required": ["client_request", "assignee"],
     },

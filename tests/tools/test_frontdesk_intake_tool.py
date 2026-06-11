@@ -9,6 +9,9 @@ def _isolated_frontdesk(monkeypatch, tmp_path, profile: str = "client-acme-staff
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", profile)
     monkeypatch.setenv("HERMES_SESSION_ID", "session_client_1")
+    # Tenant binding is trusted profile config, not a model argument.
+    monkeypatch.setenv("HERMES_FRONTDESK_TENANT", "acme")
+    monkeypatch.delenv("HERMES_FRONTDESK_WORKSPACE", raising=False)
 
     from hermes_cli import kanban_db as kb
 
@@ -27,7 +30,6 @@ def test_frontdesk_delegate_creates_client_scoped_task_without_exposing_internal
         "title": "Prepare GEO audit",
         "client_request": "Please audit our AI search visibility.",
         "assignee": "kai-sell",
-        "tenant": "acme",
     }))
 
     assert out["ok"] is True
@@ -57,7 +59,6 @@ def test_frontdesk_report_returns_completed_worker_summary_without_ids_or_paths(
         "title": "Draft LinkedIn post",
         "client_request": "Draft a launch post.",
         "assignee": "kai-sell",
-        "tenant": "acme",
     }))
     assert created["ok"] is True
 
@@ -73,7 +74,7 @@ def test_frontdesk_report_returns_completed_worker_summary_without_ids_or_paths(
     finally:
         conn.close()
 
-    report = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
+    report = json.loads(ft._handle_frontdesk_report({}))
 
     assert report["ok"] is True
     assert report["completed_count"] == 1
@@ -133,7 +134,7 @@ def test_frontdesk_report_scopes_to_current_profile_and_tenant(monkeypatch, tmp_
     finally:
         conn.close()
 
-    report = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
+    report = json.loads(ft._handle_frontdesk_report({}))
     rendered = json.dumps(report)
 
     assert report["completed_count"] == 1
@@ -163,9 +164,9 @@ def test_frontdesk_report_marks_completed_items_as_reported(monkeypatch, tmp_pat
     finally:
         conn.close()
 
-    first = json.loads(ft._handle_frontdesk_report({"tenant": "acme", "mark_reported": True}))
-    second = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
-    include = json.loads(ft._handle_frontdesk_report({"tenant": "acme", "include_reported": True}))
+    first = json.loads(ft._handle_frontdesk_report({"mark_reported": True}))
+    second = json.loads(ft._handle_frontdesk_report({}))
+    include = json.loads(ft._handle_frontdesk_report({"include_reported": True}))
 
     assert first["completed_count"] == 1
     assert second["completed_count"] == 0
@@ -192,7 +193,6 @@ def test_frontdesk_delegate_subscribes_origin_chat_for_push_reportback(monkeypat
     out = json.loads(ft._handle_frontdesk_delegate({
         "client_request": "Audit our AI search visibility.",
         "assignee": "kai-sell",
-        "tenant": "acme",
     }))
     assert out["ok"] is True
     assert out["auto_notify"] is True
@@ -227,7 +227,6 @@ def test_frontdesk_delegate_without_gateway_session_skips_subscription(monkeypat
     out = json.loads(ft._handle_frontdesk_delegate({
         "client_request": "Audit our AI search visibility.",
         "assignee": "kai-sell",
-        "tenant": "acme",
     }))
     assert out["ok"] is True
     assert out["auto_notify"] is False
@@ -261,7 +260,6 @@ def test_frontdesk_delegate_survives_subscription_failure(monkeypatch, tmp_path)
     out = json.loads(ft._handle_frontdesk_delegate({
         "client_request": "Audit our AI search visibility.",
         "assignee": "kai-sell",
-        "tenant": "acme",
     }))
     assert out["ok"] is True
     assert out["auto_notify"] is False
@@ -271,3 +269,57 @@ def test_frontdesk_delegate_survives_subscription_failure(monkeypatch, tmp_path)
         assert len(kb.list_tasks(conn, tenant="acme")) == 1
     finally:
         conn.close()
+
+
+def test_frontdesk_delegate_ignores_model_supplied_tenant_and_workspace(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(ft._handle_frontdesk_delegate({
+        "client_request": "Audit our AI search visibility.",
+        "assignee": "kai-sell",
+        # A prompt-injected client must not be able to choose either of
+        # these — tenant and workspace bind to trusted profile config only.
+        "tenant": "otherco",
+        "workspace_path": "/etc",
+    }))
+    assert out["ok"] is True
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        assert kb.list_tasks(conn, tenant="otherco") == []
+        tasks = kb.list_tasks(conn, tenant="acme")
+    finally:
+        conn.close()
+    assert len(tasks) == 1
+    assert tasks[0].workspace_path == ft.DEFAULT_WORKSPACE
+
+
+def test_frontdesk_report_ignores_model_supplied_tenant(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        other = kb.create_task(
+            conn,
+            title="Other tenant work",
+            body="must not leak",
+            assignee="kai-build",
+            tenant="otherco",
+            created_by="client-acme-staff",
+            initial_status="running",
+        )
+        kb.complete_task(conn, other, summary="Other tenant secret")
+    finally:
+        conn.close()
+
+    report = json.loads(ft._handle_frontdesk_report({"tenant": "otherco"}))
+
+    assert report["tenant"] == "acme"
+    assert report["completed_count"] == 0
+    assert "Other tenant secret" not in json.dumps(report)

@@ -20,6 +20,21 @@ def test_client_safe_text_empty_returns_fallback():
     assert client_safe_text("  ", fallback="nothing yet") == "nothing yet"
 
 
+def test_client_safe_text_scrubs_paths_outside_common_roots():
+    for path in ("/etc/passwd", "/mnt/data/report.md", "/workspace/acme/out.md"):
+        out = client_safe_text(f"see {path} for details")
+        assert path not in out, path
+        assert "[file]" in out
+
+
+def test_client_safe_text_preserves_urls():
+    text = (
+        "Published at https://example.com/docs/launch-post "
+        "and http://cdn.example.com/a/b/c.png"
+    )
+    assert client_safe_text(text) == text
+
+
 def test_completed_event_includes_scrubbed_title_and_summary():
     msg = format_client_safe_event(
         "completed",

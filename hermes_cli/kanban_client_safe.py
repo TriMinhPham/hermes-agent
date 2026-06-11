@@ -21,9 +21,11 @@ CLIENT_SAFE_STYLE = "client_safe"
 # legacy boards used 2 bytes and some docs/tests use longer ones. Match the
 # whole plausible range rather than one generator vintage.
 TASK_ID_RE = re.compile(r"\bt_[0-9a-fA-F]{4,16}\b")
-ABSOLUTE_PATH_RE = re.compile(
-    r"(?<!\w)/(?:Users|private|var|tmp|home|opt|Volumes)/[^\s,;)\]}]+"
-)
+# Any absolute path with at least two segments (/etc/passwd, /mnt/data/x.md,
+# /workspace/acme/out.md) — not just a fixed root allowlist. The lookbehind
+# rejects matches preceded by a word char, ':' or '/' so URL paths
+# (https://host/docs/x) and protocol-relative '//host/...' survive untouched.
+ABSOLUTE_PATH_RE = re.compile(r"(?<![\w:/])/[^\s/,;)\]}]+/[^\s,;)\]}]+")
 
 #: Longest client-facing message body; worker summaries should be far
 #: shorter, this only guards against runaway handoffs.
