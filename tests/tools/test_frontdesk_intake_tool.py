@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import json
+
+
+def _isolated_frontdesk(monkeypatch, tmp_path, profile: str = "client-acme-staff"):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_SESSION_ID", "session_client_1")
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(board="commercial-intake")
+    return home
+
+
+def test_frontdesk_delegate_creates_client_scoped_task_without_exposing_internal_id(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(ft._handle_frontdesk_delegate({
+        "title": "Prepare GEO audit",
+        "client_request": "Please audit our AI search visibility.",
+        "assignee": "kai-sell",
+        "tenant": "acme",
+    }))
+
+    assert out["ok"] is True
+    assert out["client_message"] == "Received — I’ll have the team work on this and report back."
+    assert out["status"] == "ready"
+    assert "task_id" not in out
+    assert "board" not in out
+    assert "assignee" not in out
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        tasks = kb.list_tasks(conn, tenant="acme", include_archived=True)
+    finally:
+        conn.close()
+    assert len(tasks) == 1
+    assert tasks[0].created_by == "client-acme-staff"
+    assert tasks[0].session_id == "session_client_1"
+
+
+def test_frontdesk_report_returns_completed_worker_summary_without_ids_or_paths(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    created = json.loads(ft._handle_frontdesk_delegate({
+        "title": "Draft LinkedIn post",
+        "client_request": "Draft a launch post.",
+        "assignee": "kai-sell",
+        "tenant": "acme",
+    }))
+    assert created["ok"] is True
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        task = kb.list_tasks(conn, tenant="acme")[0]
+        kb.complete_task(
+            conn,
+            task.id,
+            summary="Client-ready draft: Announce the product in three concise paragraphs.",
+            metadata={"artifacts": ["/secret/client/path/draft.md"]},
+        )
+    finally:
+        conn.close()
+
+    report = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
+
+    assert report["ok"] is True
+    assert report["completed_count"] == 1
+    assert report["active_count"] == 0
+    assert report["client_reports"] == [
+        {
+            "title": "Draft LinkedIn post",
+            "status": "completed",
+            "summary": "Client-ready draft: Announce the product in three concise paragraphs.",
+        }
+    ]
+    rendered = json.dumps(report)
+    assert task.id not in rendered
+    assert "commercial-intake" not in rendered
+    assert "kai-sell" not in rendered
+    assert "/secret/client/path" not in rendered
+
+
+def test_frontdesk_report_scopes_to_current_profile_and_tenant(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path, profile="client-acme-staff")
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        own = kb.create_task(
+            conn,
+            title="Own completed work",
+            body="client work",
+            assignee="kai-build",
+            tenant="acme",
+            created_by="client-acme-staff",
+            initial_status="running",
+        )
+        kb.complete_task(conn, own, summary="Own client-safe summary")
+        other_profile = kb.create_task(
+            conn,
+            title="Other client work",
+            body="must not leak",
+            assignee="kai-build",
+            tenant="acme",
+            created_by="client-other-staff",
+            initial_status="running",
+        )
+        kb.complete_task(conn, other_profile, summary="Other profile secret")
+        other_tenant = kb.create_task(
+            conn,
+            title="Other tenant work",
+            body="must not leak",
+            assignee="kai-build",
+            tenant="otherco",
+            created_by="client-acme-staff",
+            initial_status="running",
+        )
+        kb.complete_task(conn, other_tenant, summary="Other tenant secret")
+    finally:
+        conn.close()
+
+    report = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
+    rendered = json.dumps(report)
+
+    assert report["completed_count"] == 1
+    assert report["client_reports"][0]["summary"] == "Own client-safe summary"
+    assert "Other profile secret" not in rendered
+    assert "Other tenant secret" not in rendered
+
+
+def test_frontdesk_report_marks_completed_items_as_reported(monkeypatch, tmp_path):
+    _isolated_frontdesk(monkeypatch, tmp_path)
+
+    from tools import frontdesk_intake_tool as ft
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board="commercial-intake")
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Completed once",
+            body="client work",
+            assignee="kai-build",
+            tenant="acme",
+            created_by="client-acme-staff",
+            initial_status="running",
+        )
+        kb.complete_task(conn, tid, summary="Ready to send once")
+    finally:
+        conn.close()
+
+    first = json.loads(ft._handle_frontdesk_report({"tenant": "acme", "mark_reported": True}))
+    second = json.loads(ft._handle_frontdesk_report({"tenant": "acme"}))
+    include = json.loads(ft._handle_frontdesk_report({"tenant": "acme", "include_reported": True}))
+
+    assert first["completed_count"] == 1
+    assert second["completed_count"] == 0
+    assert include["completed_count"] == 1
